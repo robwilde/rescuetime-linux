@@ -1,0 +1,198 @@
+### RescueTime Authentication & API Testing
+### Based on complete reverse engineering of RescueTime v2.16.5.1 Linux binary
+### See: RescueTime-Complete-Authentication-Reverse-Engineering-Report.md
+###
+### IMPORTANT: Replace {{email}} and {{password}} with your actual credentials
+### Response includes BOTH account_key and data_key - no secondary endpoint needed!
+
+###
+### PRIMARY ACTIVATION METHODS (Reverse Engineered from Binary)
+###
+
+### 1. Regular User Activation (CORRECT METHOD - from binary analysis)
+### Returns: { "account_key": "32-char-hex", "data_key": "44-char-base64" }
+POST https://www.rescuetime.com/activate
+Accept: application/json
+Content-Type: application/json
+User-Agent: RescueTime/2.16.5.1 (Linux)
+
+{
+  "username": "{{email}}",
+  "password": "{{password}}",
+  "computer_name": "test-linux-machine"
+}
+
+### 2. Regular User Activation with 2FA
+POST https://www.rescuetime.com/activate
+Accept: application/json
+Content-Type: application/json
+User-Agent: RescueTime/2.16.5.1 (Linux)
+
+{
+  "username": "{{email}}",
+  "password": "{{password}}",
+  "computer_name": "test-linux-machine",
+  "two_factor_auth_code": "123456"
+}
+
+### 3. Enterprise Team Activation
+POST https://www.rescuetime.com/activate
+Accept: application/json
+Content-Type: application/json
+User-Agent: RescueTime/2.16.5.1 (Linux)
+
+{
+  "enterprise_team_key": "YOUR_ENTERPRISE_TEAM_KEY"
+}
+
+### 4. Minimal Activation (username/password only)
+POST https://www.rescuetime.com/activate
+Accept: application/json
+Content-Type: application/json
+
+{
+  "username": "{{email}}",
+  "password": "{{password}}"
+}
+
+###
+### LEGACY/INCORRECT ATTEMPTS (For Historical Reference)
+### NOTE: These are NOT needed - activation returns both keys in one response!
+###
+
+### [OBSOLETE] Discovery attempts were based on assumption that data_key required separate endpoint
+### Binary analysis reveals both account_key and data_key are returned by /activate endpoint
+
+### INCORRECT-1. Using "email" instead of "username" parameter
+# POST https://www.rescuetime.com/activate
+# Content-Type: application/json
+# { "email": "{{email}}", "password": "{{password}}" }
+
+### INCORRECT-2. Using form-encoded instead of JSON
+# POST https://www.rescuetime.com/activate
+# Content-Type: application/x-www-form-urlencoded
+# username={{email}}&password={{password}}
+
+### INCORRECT-3. Separate endpoints for enterprise (they all use /activate)
+# POST https://api.rescuetime.com/activate_enterprise
+# POST https://api.rescuetime.com/activate_silent
+
+### INCORRECT-4. Token exchange endpoints (don't exist in this system)
+# POST https://api.rescuetime.com/token
+# POST https://api.rescuetime.com/activate/token
+
+###
+### NATIVE API TESTS (After Activation)
+### Use the account_key and data_key received from activation response
+###
+
+### 5. Native API - PRIMARY METHOD (Bearer with data_key)
+### This is the preferred method according to binary analysis
+POST https://api.rescuetime.com/api/resource/user_client_events
+Authorization: Bearer {{data_key}}
+Content-Type: application/json; charset=utf-8
+User-Agent: RescueTime/2.16.5.1 (Linux)
+
+{
+  "user_client_event": {
+    "event_description": "test-app",
+    "start_time": "2025-10-02T14:00:00Z",
+    "end_time": "2025-10-02T14:05:00Z",
+    "window_title": "Test Window - API Testing",
+    "application": "test-app"
+  }
+}
+
+### 6. Native API - FALLBACK METHOD (Query parameter with account_key)
+POST https://api.rescuetime.com/api/resource/user_client_events?key={{account_key}}
+Content-Type: application/json; charset=utf-8
+User-Agent: RescueTime/2.16.5.1 (Linux)
+
+{
+  "user_client_event": {
+    "event_description": "test-app",
+    "start_time": "2025-10-02T14:00:00Z",
+    "end_time": "2025-10-02T14:05:00Z",
+    "window_title": "Test Window - API Testing",
+    "application": "test-app"
+  }
+}
+
+###
+### LEGACY/PUBLIC API (Different from Native Client API)
+### Note: Uses api_key (public API key) not account_key or data_key
+###
+
+### 7. Legacy offline_time_post API (currently used in active-window.go)
+### This API uses the PUBLIC api_key, not the account_key/data_key from activation
+POST https://www.rescuetime.com/anapi/offline_time_post?key={{api_key}}
+Content-Type: application/json
+
+{
+  "start_time": "2025-10-02 14:00:00",
+  "duration": 5,
+  "activity_name": "test-app",
+  "activity_details": "Test Window - API Testing"
+}
+
+###
+### SUPPLEMENTARY CLIENT API ENDPOINTS (For Reference)
+### These use data_key authentication
+###
+
+### 8. Get client configuration
+GET https://api.rescuetime.com/config
+Authorization: Bearer {{data_key}}
+
+### 9. Get alerts
+GET https://api.rescuetime.com/api/alerts
+Authorization: Bearer {{data_key}}
+
+### 10. Get block list
+GET https://api.rescuetime.com/api/block_list
+Authorization: Bearer {{data_key}}
+
+### 11. Check client version (public endpoint)
+GET https://api.rescuetime.com/client_version
+
+### 12. Get browser support detection
+GET https://api.rescuetime.com/api/client_browser_support?os_id=linux
+Authorization: Bearer {{data_key}}
+
+###
+### OAUTH ENDPOINTS (Alternative Authentication System)
+### NOTE: This is a different system from the desktop client activation
+###
+
+### 13. OAuth authorize (web browser flow - for reference only)
+### https://www.rescuetime.com/oauth/authorize?client_id=YOUR_CLIENT_ID&redirect_uri=YOUR_REDIRECT_URI&response_type=code&scope=time_data
+
+### 14. OAuth token exchange (for web/mobile apps)
+POST https://www.rescuetime.com/oauth/token
+Content-Type: application/json
+
+{
+  "client_id": "YOUR_CLIENT_ID",
+  "client_secret": "YOUR_CLIENT_SECRET",
+  "grant_type": "authorization_code",
+  "code": "AUTH_CODE",
+  "redirect_uri": "YOUR_REDIRECT_URI"
+}
+
+###
+### EXPECTED RESPONSE FORMATS
+###
+
+### Activation Response (from requests 1-4):
+# {
+#   "account_key": "186c3aa4fddc9204ea5e6cb2dfb50fa2",  // 32-char hex
+#   "data_key": "B633XlfzSI__qItgt7BG8IGlvFJLYoQT69seoVwt"   // 44-char base64-like
+# }
+
+### Native API Success Response:
+# HTTP 200 OK or 201 Created
+# { "success": true } or similar
+
+### Error Response:
+# HTTP 4xx or 5xx
+# { "error": "error message" } or similar
