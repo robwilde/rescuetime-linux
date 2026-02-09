@@ -1,1 +1,6 @@
-.ideahttp-client.env.json
+.idea/
+http-client.env.json
+active-window
+.env
+*.log
+sessions.json
