@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -90,8 +91,6 @@ func activateWithRescueTime(email, password string) (*ActivationResponse, error)
 	}
 
 	// Parse response to extract account_key
-	// TODO: The response only contains account_key, not data_key
-	// We need to discover how to obtain the data_key (separate endpoint? different auth flow?)
 	var accountKey string
 	for _, line := range strings.Split(bodyStr, "\n") {
 		if strings.HasPrefix(line, "account_key:") {
@@ -104,11 +103,9 @@ func activateWithRescueTime(email, password string) (*ActivationResponse, error)
 		return nil, fmt.Errorf("no account_key in response: %s", bodyStr)
 	}
 
-	// Return response with account_key
-	// Note: data_key is empty - needs further investigation
 	return &ActivationResponse{
 		AccountKey: accountKey,
-		DataKey:    "", // TODO: Discover how to obtain data_key
+		DataKey:    "",
 		ApiURL:     "api.rescuetime.com",
 		URL:        "www.rescuetime.com",
 	}, nil
@@ -230,7 +227,7 @@ func summaryToUserClientEvent(summary ActivitySummary) UserClientEventPayload {
 			StartTime:        startTimeFormatted,
 			EndTime:          endTimeFormatted,
 			WindowTitle:      summary.ActivityDetails,
-			Application:      summary.AppClass, // Same as EventDescription
+			Application:      summary.AppClass,
 		},
 	}
 }
@@ -246,7 +243,8 @@ func submitToRescueTime(apiKey string, payload RescueTimePayload) error {
 		if attempt > 0 {
 			// Exponential backoff: 1s, 2s, 4s
 			delay := baseDelay * time.Duration(math.Pow(2, float64(attempt-1)))
-			fmt.Printf("Retrying in %v... (attempt %d/%d)\n", delay, attempt+1, maxRetries)
+			slog.Debug("retrying legacy API submission",
+				"delay", delay, "attempt", attempt+1, "max_attempts", maxRetries)
 			time.Sleep(delay)
 		}
 
@@ -280,7 +278,8 @@ func submitToRescueTime(apiKey string, payload RescueTimePayload) error {
 
 		// Check response status
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			fmt.Printf("✓ Submitted to RescueTime: %s (%d min)\n", payload.ActivityName, payload.Duration)
+			slog.Info("submitted to RescueTime (legacy)",
+				"app", payload.ActivityName, "duration_min", payload.Duration)
 			return nil
 		}
 
@@ -307,7 +306,8 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 		if attempt > 0 {
 			// Exponential backoff: 1s, 2s, 4s
 			delay := baseDelay * time.Duration(math.Pow(2, float64(attempt-1)))
-			fmt.Printf("Retrying in %v... (attempt %d/%d)\n", delay, attempt+1, maxRetries)
+			slog.Debug("retrying native API submission",
+				"delay", delay, "attempt", attempt+1, "max_attempts", maxRetries)
 			time.Sleep(delay)
 		}
 
@@ -321,28 +321,23 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 
 		// Try Bearer token auth if query param auth failed with 401
 		if tryBearerAuth {
-			// Create request WITHOUT query parameter
 			url := "https://api.rescuetime.com/api/resource/user_client_events"
 			req, err = http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 			if err != nil {
 				lastErr = fmt.Errorf("failed to create request: %v", err)
 				continue
 			}
-			// Use Bearer token authentication with data_key
-			// The desktop app uses the data_key as the Bearer token
 			dataKey := os.Getenv("RESCUE_TIME_DATA_KEY")
 			if dataKey == "" {
-				dataKey = apiKey // Fallback to provided API key
+				dataKey = apiKey
 			}
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", dataKey))
 
-			// Also try adding account_key as a query parameter along with Bearer token
 			accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
 			if accountKey != "" {
 				req.URL.RawQuery = fmt.Sprintf("key=%s", accountKey)
 			}
 		} else {
-			// Try query parameter authentication first with account_key
 			authKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
 			if authKey == "" {
 				authKey = apiKey
@@ -377,11 +372,11 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 			if tryBearerAuth {
 				authMethod = "Bearer token"
 			}
-			fmt.Printf("✓ Submitted to RescueTime via %s: %s (%s to %s)\n",
-				authMethod,
-				payload.UserClientEvent.Application,
-				payload.UserClientEvent.StartTime,
-				payload.UserClientEvent.EndTime)
+			slog.Info("submitted to RescueTime (native)",
+				"auth", authMethod,
+				"app", payload.UserClientEvent.Application,
+				"start", payload.UserClientEvent.StartTime,
+				"end", payload.UserClientEvent.EndTime)
 			return nil
 		}
 
@@ -389,7 +384,8 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 
 		// If we got 401 with query param auth, try Bearer token auth next
 		if resp.StatusCode == 401 && !tryBearerAuth {
-			fmt.Println("Query parameter auth failed (401), trying Bearer token authentication...")
+			slog.Warn("query parameter auth failed, trying Bearer token",
+				"status", resp.StatusCode)
 			tryBearerAuth = true
 			continue
 		}
@@ -408,7 +404,7 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 // falls back to offline_time_post API if native fails or credentials are missing.
 func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySummary) {
 	if len(summaries) == 0 {
-		fmt.Println("No activities to submit.")
+		slog.Debug("no activities to submit")
 		return
 	}
 
@@ -417,12 +413,8 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 	accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
 	hasNativeCredentials := dataKey != "" || accountKey != ""
 
-	fmt.Printf("\n=== Submitting %d activities to RescueTime ===\n", len(summaries))
-	if hasNativeCredentials {
-		fmt.Println("[INFO] Native API credentials detected, will try native API first with legacy fallback")
-	} else {
-		fmt.Println("[INFO] Using legacy offline time API (no native credentials found)")
-	}
+	slog.Info("starting submission", "activity_count", len(summaries),
+		"native_credentials", hasNativeCredentials)
 
 	successCount := 0
 	failCount := 0
@@ -432,6 +424,8 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 	for _, summary := range summaries {
 		// Skip activities with a very short duration (< 1 minute)
 		if summary.TotalDuration < time.Minute {
+			slog.Debug("skipping short activity",
+				"app", summary.AppClass, "duration", summary.TotalDuration)
 			continue
 		}
 
@@ -439,15 +433,13 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 		usedFallback := false
 
 		if hasNativeCredentials {
-			// Try native API first
-			fmt.Printf("[ATTEMPT] Trying native API for %s...\n", summary.AppClass)
+			slog.Debug("trying native API", "app", summary.AppClass)
 			payload := summaryToUserClientEvent(summary)
 			err = submitUserClientEvent(apiKey, payload)
 
 			if err != nil {
-				// Native API failed, log and try legacy fallback
-				fmt.Fprintf(os.Stderr, "[WARN] Native API failed for %s: %v\n", summary.AppClass, err)
-				fmt.Printf("[FALLBACK] Attempting legacy API for %s...\n", summary.AppClass)
+				slog.Warn("native API failed, trying legacy fallback",
+					"app", summary.AppClass, "error", err)
 
 				legacyPayload := summaryToPayload(summary)
 				err = submitToRescueTime(apiKey, legacyPayload)
@@ -456,13 +448,13 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 				nativeSuccessCount++
 			}
 		} else {
-			// No native credentials, use legacy API directly
 			payload := summaryToPayload(summary)
 			err = submitToRescueTime(apiKey, payload)
 		}
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "✗ Failed to submit %s: %v\n", summary.AppClass, err)
+			slog.Error("failed to submit activity",
+				"app", summary.AppClass, "error", err)
 			failCount++
 		} else {
 			successCount++
@@ -472,10 +464,7 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 		}
 	}
 
-	fmt.Printf("\n=== Submission Summary ===\n")
-	fmt.Printf("Total succeeded: %d, failed: %d\n", successCount, failCount)
-	if hasNativeCredentials {
-		fmt.Printf("Native API successes: %d\n", nativeSuccessCount)
-		fmt.Printf("Legacy fallback successes: %d\n", legacyFallbackCount)
-	}
+	slog.Info("submission complete",
+		"succeeded", successCount, "failed", failCount,
+		"native", nativeSuccessCount, "legacy_fallback", legacyFallbackCount)
 }
