@@ -1,72 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
 )
-
-// HyprlandWindow represents the JSON structure returned by hyprctl activewindow -j
-type HyprlandWindow struct {
-	Address   string `json:"address"`
-	Mapped    bool   `json:"mapped"`
-	Hidden    bool   `json:"hidden"`
-	At        [2]int `json:"at"`
-	Size      [2]int `json:"size"`
-	Workspace struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-	} `json:"workspace"`
-	Floating     bool   `json:"floating"`
-	Pseudo       bool   `json:"pseudo"`
-	Monitor      int    `json:"monitor"`
-	Class        string `json:"class"`
-	Title        string `json:"title"`
-	InitialClass string `json:"initialClass"`
-	InitialTitle string `json:"initialTitle"`
-	Pid          int    `json:"pid"`
-	Xwayland     bool   `json:"xwayland"`
-	Pinned       bool   `json:"pinned"`
-	Fullscreen   int    `json:"fullscreen"`
-}
-
-func getActiveWindow() (*HyprlandWindow, error) {
-	cmd := exec.Command("hyprctl", "activewindow", "-j")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active window from hyprctl: %v", err)
-	}
-
-	var window HyprlandWindow
-	err = json.Unmarshal(output, &window)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse hyprctl JSON output: %v", err)
-	}
-
-	return &window, nil
-}
-
-func getActiveWindowName() (string, error) {
-	window, err := getActiveWindow()
-	if err != nil {
-		return "", err
-	}
-	return window.Title, nil
-}
-
-func getActiveWindowClass() (string, error) {
-	window, err := getActiveWindow()
-	if err != nil {
-		return "", err
-	}
-	return window.Class, nil
-}
 
 func formatWindowOutput(windowName, windowClass string) string {
 	if windowClass != "" {
@@ -137,17 +79,15 @@ func printLiveStats(tracker *ActivityTracker, startTime time.Time) {
 	fmt.Println("---")
 }
 
-func getCurrentWindowInfo() (string, error) {
-	windowName, err := getActiveWindowName()
+func getCurrentWindowInfo(backend WindowBackend) (string, error) {
+	window, err := backend.GetActiveWindow()
 	if err != nil {
 		return "", err
 	}
-
-	windowClass, _ := getActiveWindowClass()
-	return formatWindowOutput(windowName, windowClass), nil
+	return formatWindowOutput(window.Title, window.Class), nil
 }
 
-func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string, showStats bool, statsInterval time.Duration) {
+func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, apiKey string, showStats bool, statsInterval time.Duration) {
 	var lastAppClass, lastWindowTitle string
 
 	// Create activity tracker and title cleaner
@@ -173,7 +113,7 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string, showStats
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Get initial window info and start the first session
-	window, err := getActiveWindow()
+	window, err := backend.GetActiveWindow()
 	if err != nil {
 		slog.Error("failed to get initial window info", "error", err)
 		return
@@ -263,7 +203,7 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string, showStats
 			printLiveStats(tracker, startTime)
 
 		case <-pollTicker.C:
-			window, err := getActiveWindow()
+			window, err := backend.GetActiveWindow()
 			if err != nil {
 				slog.Debug("failed to get active window", "error", err)
 				continue
@@ -351,15 +291,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check if hyprctl is available (required for Wayland/Hyprland)
-	if os.Getenv("WAYLAND_DISPLAY") != "" {
-		_, err := exec.LookPath("hyprctl")
-		if err != nil {
-			slog.Error("hyprctl not found",
-				"hint", "This application requires Hyprland on Wayland")
-			os.Exit(1)
-		}
+	// Auto-detect window backend (hyprctl or xdotool)
+	backend, err := DetectBackend()
+	if err != nil {
+		slog.Error("no window backend available", "error", err)
+		os.Exit(1)
 	}
+	slog.Info("detected window backend", "backend", backend.Name())
 
 	if *monitor || *track {
 		if *track {
@@ -387,13 +325,13 @@ func main() {
 				os.Exit(1)
 			}
 
-			monitorWindowChanges(cfg, true, apiKey, *stats, *statsInterval)
+			monitorWindowChanges(backend, cfg, true, apiKey, *stats, *statsInterval)
 		} else {
-			monitorWindowChanges(cfg, false, "", *stats, *statsInterval)
+			monitorWindowChanges(backend, cfg, false, "", *stats, *statsInterval)
 		}
 	} else {
 		// Single execution mode
-		currentInfo, err := getCurrentWindowInfo()
+		currentInfo, err := getCurrentWindowInfo(backend)
 		if err != nil {
 			slog.Error("failed to get window info", "error", err)
 			os.Exit(1)
