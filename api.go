@@ -399,13 +399,31 @@ func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error 
 	return fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
 }
 
+// SubmissionResult holds the outcome of a batch submission
+type SubmissionResult struct {
+	Succeeded      int
+	Failed         int
+	NativeSuccess  int
+	LegacyFallback int
+	Errors         []error
+}
+
+// submissionItem holds the result of a single activity submission
+type submissionItem struct {
+	err      error
+	native   bool
+	fallback bool
+}
+
 // submitActivitiesToRescueTime submits all activity summaries to RescueTime
-// Attempts native user_client_events API first if credentials are available,
-// falls back to offline_time_post API if native fails or credentials are missing.
-func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySummary) {
+// using bounded concurrency (3 goroutines). Attempts native API first if
+// credentials are available, falls back to legacy API.
+func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySummary) SubmissionResult {
+	result := SubmissionResult{}
+
 	if len(summaries) == 0 {
 		slog.Debug("no activities to submit")
-		return
+		return result
 	}
 
 	// Check if we have native API credentials
@@ -413,58 +431,86 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 	accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
 	hasNativeCredentials := dataKey != "" || accountKey != ""
 
-	slog.Info("starting submission", "activity_count", len(summaries),
-		"native_credentials", hasNativeCredentials)
-
-	successCount := 0
-	failCount := 0
-	nativeSuccessCount := 0
-	legacyFallbackCount := 0
-
+	// Filter to submittable activities (>= 1 minute)
+	var toSubmit []ActivitySummary
 	for _, summary := range summaries {
-		// Skip activities with a very short duration (< 1 minute)
 		if summary.TotalDuration < time.Minute {
 			slog.Debug("skipping short activity",
 				"app", summary.AppClass, "duration", summary.TotalDuration)
 			continue
 		}
+		toSubmit = append(toSubmit, summary)
+	}
 
-		var err error
-		usedFallback := false
+	if len(toSubmit) == 0 {
+		slog.Debug("no activities above minimum duration")
+		return result
+	}
 
-		if hasNativeCredentials {
-			slog.Debug("trying native API", "app", summary.AppClass)
-			payload := summaryToUserClientEvent(summary)
-			err = submitUserClientEvent(apiKey, payload)
+	slog.Info("starting submission", "activity_count", len(toSubmit),
+		"native_credentials", hasNativeCredentials)
 
-			if err != nil {
-				slog.Warn("native API failed, trying legacy fallback",
-					"app", summary.AppClass, "error", err)
+	// Bounded concurrency with semaphore channel
+	const maxConcurrent = 3
+	sem := make(chan struct{}, maxConcurrent)
+	results := make(chan submissionItem, len(toSubmit))
 
-				legacyPayload := summaryToPayload(summary)
-				err = submitToRescueTime(apiKey, legacyPayload)
-				usedFallback = true
+	for _, summary := range toSubmit {
+		sem <- struct{}{} // acquire
+		go func(s ActivitySummary) {
+			defer func() { <-sem }() // release
+
+			item := submissionItem{}
+
+			if hasNativeCredentials {
+				slog.Debug("trying native API", "app", s.AppClass)
+				payload := summaryToUserClientEvent(s)
+				err := submitUserClientEvent(apiKey, payload)
+
+				if err != nil {
+					slog.Warn("native API failed, trying legacy fallback",
+						"app", s.AppClass, "error", err)
+					legacyPayload := summaryToPayload(s)
+					err = submitToRescueTime(apiKey, legacyPayload)
+					if err == nil {
+						item.fallback = true
+					} else {
+						item.err = err
+					}
+				} else {
+					item.native = true
+				}
 			} else {
-				nativeSuccessCount++
+				payload := summaryToPayload(s)
+				if err := submitToRescueTime(apiKey, payload); err != nil {
+					item.err = err
+				}
 			}
-		} else {
-			payload := summaryToPayload(summary)
-			err = submitToRescueTime(apiKey, payload)
-		}
 
-		if err != nil {
-			slog.Error("failed to submit activity",
-				"app", summary.AppClass, "error", err)
-			failCount++
+			results <- item
+		}(summary)
+	}
+
+	// Collect results
+	for range len(toSubmit) {
+		item := <-results
+		if item.err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, item.err)
 		} else {
-			successCount++
-			if usedFallback {
-				legacyFallbackCount++
+			result.Succeeded++
+			if item.native {
+				result.NativeSuccess++
+			}
+			if item.fallback {
+				result.LegacyFallback++
 			}
 		}
 	}
 
 	slog.Info("submission complete",
-		"succeeded", successCount, "failed", failCount,
-		"native", nativeSuccessCount, "legacy_fallback", legacyFallbackCount)
+		"succeeded", result.Succeeded, "failed", result.Failed,
+		"native", result.NativeSuccess, "legacy_fallback", result.LegacyFallback)
+
+	return result
 }

@@ -103,6 +103,40 @@ func printActivitySummary(tracker *ActivityTracker) {
 	}
 }
 
+// printLiveStats prints a compact top-5 apps by duration
+func printLiveStats(tracker *ActivityTracker, startTime time.Time) {
+	summaries := tracker.GetActivitySummaries()
+	if len(summaries) == 0 {
+		return
+	}
+
+	// Sort by duration (top 5)
+	type entry struct {
+		app      string
+		duration time.Duration
+	}
+	var sorted []entry
+	for app, s := range summaries {
+		sorted = append(sorted, entry{app, s.TotalDuration})
+	}
+	// Simple insertion sort — at most ~20 apps
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].duration > sorted[j-1].duration; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	if len(sorted) > 5 {
+		sorted = sorted[:5]
+	}
+
+	elapsed := time.Since(startTime).Round(time.Second)
+	fmt.Printf("\n--- Stats (uptime %v) ---\n", elapsed)
+	for _, e := range sorted {
+		fmt.Printf("  %s: %v\n", e.app, e.duration.Round(time.Second))
+	}
+	fmt.Println("---")
+}
+
 func getCurrentWindowInfo() (string, error) {
 	windowName, err := getActiveWindowName()
 	if err != nil {
@@ -113,7 +147,7 @@ func getCurrentWindowInfo() (string, error) {
 	return formatWindowOutput(windowName, windowClass), nil
 }
 
-func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
+func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string, showStats bool, statsInterval time.Duration) {
 	var lastAppClass, lastWindowTitle string
 
 	// Create activity tracker and title cleaner
@@ -168,6 +202,17 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 		slog.Info("API submission enabled", "interval", cfg.SubmissionInterval.Duration)
 	}
 
+	var statsTicker *time.Ticker
+	var statsChan <-chan time.Time
+	startTime := time.Now()
+
+	if showStats {
+		statsTicker = time.NewTicker(statsInterval)
+		defer statsTicker.Stop()
+		statsChan = statsTicker.C
+		slog.Info("live stats enabled", "interval", statsInterval)
+	}
+
 	for {
 		select {
 		case <-sigChan:
@@ -214,6 +259,9 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 				}
 			}
 
+		case <-statsChan:
+			printLiveStats(tracker, startTime)
+
 		case <-pollTicker.C:
 			window, err := getActiveWindow()
 			if err != nil {
@@ -249,6 +297,10 @@ func main() {
 	track := flag.Bool("track", false, "Monitor and track time spent in applications")
 	submit := flag.Bool("submit", false, "Submit activity data to RescueTime API")
 	configPath := flag.String("config", "", "Config file path (default: ~/.config/rescuetime-linux/config.json)")
+
+	// Stats flags
+	stats := flag.Bool("stats", false, "Show periodic activity statistics")
+	statsInterval := flag.Duration("stats-interval", 60*time.Second, "Interval for live stats display (e.g., 10s, 60s)")
 
 	// These flags override config file values
 	interval := flag.String("interval", "", "Polling interval (e.g., 100ms, 1s)")
@@ -335,9 +387,9 @@ func main() {
 				os.Exit(1)
 			}
 
-			monitorWindowChanges(cfg, true, apiKey)
+			monitorWindowChanges(cfg, true, apiKey, *stats, *statsInterval)
 		} else {
-			monitorWindowChanges(cfg, false, "")
+			monitorWindowChanges(cfg, false, "", *stats, *statsInterval)
 		}
 	} else {
 		// Single execution mode
