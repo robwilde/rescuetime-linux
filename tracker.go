@@ -34,12 +34,12 @@ type ActivityTracker struct {
 	minDuration    time.Duration // ignore sessions shorter than this
 }
 
-// NewActivityTracker creates a new activity tracker with default settings
-func NewActivityTracker() *ActivityTracker {
+// NewActivityTracker creates a new activity tracker with the given configuration
+func NewActivityTracker(mergeThreshold, minDuration time.Duration) *ActivityTracker {
 	return &ActivityTracker{
 		sessions:       make([]ActivitySession, 0),
-		mergeThreshold: 30 * time.Second, // merge sessions if gap is less than 30s
-		minDuration:    10 * time.Second, // ignore sessions shorter than 10s
+		mergeThreshold: mergeThreshold,
+		minDuration:    minDuration,
 	}
 }
 

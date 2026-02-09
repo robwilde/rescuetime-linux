@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -36,7 +37,6 @@ type HyprlandWindow struct {
 }
 
 func getActiveWindow() (*HyprlandWindow, error) {
-	// Use hyprctl to get active window information in JSON format
 	cmd := exec.Command("hyprctl", "activewindow", "-j")
 	output, err := cmd.Output()
 	if err != nil {
@@ -113,11 +113,11 @@ func getCurrentWindowInfo() (string, error) {
 	return formatWindowOutput(windowName, windowClass), nil
 }
 
-func monitorWindowChanges(interval time.Duration, submitToAPI bool, apiKey string, submissionInterval time.Duration) {
+func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 	var lastAppClass, lastWindowTitle string
 
-	// Create activity tracker
-	tracker := NewActivityTracker()
+	// Create activity tracker with config values
+	tracker := NewActivityTracker(cfg.MergeThreshold.Duration, cfg.MinDuration.Duration)
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -126,7 +126,7 @@ func monitorWindowChanges(interval time.Duration, submitToAPI bool, apiKey strin
 	// Get initial window info and start the first session
 	window, err := getActiveWindow()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting initial window info: %v\n", err)
+		slog.Error("failed to get initial window info", "error", err)
 		return
 	}
 
@@ -135,27 +135,27 @@ func monitorWindowChanges(interval time.Duration, submitToAPI bool, apiKey strin
 	lastAppClass = window.Class
 	lastWindowTitle = window.Title
 
-	// Print initial window
+	// Print initial window (user-facing)
 	currentInfo := formatWindowOutput(window.Title, window.Class)
 	fmt.Printf("%s [%s]\n", currentInfo, time.Now().Format("15:04:05"))
 
-	pollTicker := time.NewTicker(interval)
+	pollTicker := time.NewTicker(cfg.PollingInterval.Duration)
 	defer pollTicker.Stop()
 
 	var submitTicker *time.Ticker
 	var submitChan <-chan time.Time
 
 	if submitToAPI {
-		submitTicker = time.NewTicker(submissionInterval)
+		submitTicker = time.NewTicker(cfg.SubmissionInterval.Duration)
 		defer submitTicker.Stop()
 		submitChan = submitTicker.C
-		fmt.Printf("API submission enabled: will submit every %v\n", submissionInterval)
+		slog.Info("API submission enabled", "interval", cfg.SubmissionInterval.Duration)
 	}
 
 	for {
 		select {
 		case <-sigChan:
-			fmt.Println("\nShutting down window monitor...")
+			slog.Info("shutting down window monitor")
 
 			// End the current session
 			tracker.EndCurrentSession()
@@ -166,12 +166,12 @@ func monitorWindowChanges(interval time.Duration, submitToAPI bool, apiKey strin
 				submitActivitiesToRescueTime(apiKey, summaries)
 			}
 
-			// Print summary before exit
+			// Print summary before exit (user-facing)
 			printActivitySummary(tracker)
 			return
 
 		case <-submitChan:
-			// Time to submit data to RescueTime
+			slog.Debug("submission tick triggered")
 			summaries := tracker.GetActivitySummaries()
 			submitActivitiesToRescueTime(apiKey, summaries)
 
@@ -181,16 +181,20 @@ func monitorWindowChanges(interval time.Duration, submitToAPI bool, apiKey strin
 		case <-pollTicker.C:
 			window, err := getActiveWindow()
 			if err != nil {
-				// Don't spam errors, just skip this iteration
+				slog.Debug("failed to get active window", "error", err)
 				continue
 			}
 
 			// Check if the application or window title changed
 			if window.Class != lastAppClass || window.Title != lastWindowTitle {
+				slog.Debug("window changed",
+					"from_app", lastAppClass, "to_app", window.Class,
+					"title", window.Title)
+
 				// Start a new session for the new window/app
 				tracker.StartSession(window.Class, window.Title)
 
-				// Print the change
+				// Print the change (user-facing)
 				currentInfo := formatWindowOutput(window.Title, window.Class)
 				fmt.Printf("%s [%s]\n", currentInfo, time.Now().Format("15:04:05"))
 
@@ -207,13 +211,54 @@ func main() {
 	monitor := flag.Bool("monitor", false, "Continuously monitor for window changes")
 	track := flag.Bool("track", false, "Monitor and track time spent in applications")
 	submit := flag.Bool("submit", false, "Submit activity data to RescueTime API")
-	interval := flag.Duration("interval", 200*time.Millisecond, "Polling interval for monitoring mode (e.g., 100ms, 1s)")
-	submissionInterval := flag.Duration("submission-interval", 15*time.Minute, "Interval for submitting data to RescueTime (e.g., 15m, 1h)")
+	configPath := flag.String("config", "", "Config file path (default: ~/.config/rescuetime-linux/config.json)")
+
+	// These flags override config file values
+	interval := flag.String("interval", "", "Polling interval (e.g., 100ms, 1s)")
+	submissionInterval := flag.String("submission-interval", "", "Submission interval (e.g., 15m, 1h)")
+	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error")
+	logFile := flag.String("log-file", "", "Log file path")
 	flag.Parse()
+
+	// Load configuration: defaults < config file < CLI flags
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Apply CLI flag overrides (only flags that were explicitly set)
+	cliFlags := make(map[string]string)
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "interval":
+			cliFlags["interval"] = *interval
+		case "submission-interval":
+			cliFlags["submission-interval"] = *submissionInterval
+		case "log-level":
+			cliFlags["log-level"] = *logLevel
+		case "log-file":
+			cliFlags["log-file"] = *logFile
+		}
+	})
+	cfg.ApplyCLIFlags(cliFlags)
+
+	// Set up structured logging (using final resolved config)
+	level := parseLogLevel(cfg.LogLevel)
+	cleanupLogger := setupLogger(level, cfg.LogFile)
+	defer cleanupLogger()
+
+	slog.Debug("configuration loaded",
+		"polling_interval", cfg.PollingInterval.Duration,
+		"submission_interval", cfg.SubmissionInterval.Duration,
+		"merge_threshold", cfg.MergeThreshold.Duration,
+		"min_duration", cfg.MinDuration.Duration,
+		"log_level", cfg.LogLevel)
 
 	// Check if we're running in a graphical environment (Wayland or X11)
 	if os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") == "" {
-		fmt.Fprintf(os.Stderr, "Error: No graphical display found. Make sure you're running this in a Wayland or X11 environment.\n")
+		slog.Error("no graphical display found",
+			"hint", "Make sure you're running this in a Wayland or X11 environment")
 		os.Exit(1)
 	}
 
@@ -221,46 +266,47 @@ func main() {
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		_, err := exec.LookPath("hyprctl")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: hyprctl not found. This script requires Hyprland on Wayland.\n")
+			slog.Error("hyprctl not found",
+				"hint", "This application requires Hyprland on Wayland")
 			os.Exit(1)
 		}
 	}
 
 	if *monitor || *track {
 		if *track {
-			fmt.Printf("Tracking application usage (polling every %v). Press Ctrl+C to stop and see summary.\n", *interval)
+			fmt.Printf("Tracking application usage (polling every %v). Press Ctrl+C to stop and see summary.\n",
+				cfg.PollingInterval.Duration)
 		} else {
-			fmt.Printf("Monitoring window changes (polling every %v). Press Ctrl+C to stop.\n", *interval)
+			fmt.Printf("Monitoring window changes (polling every %v). Press Ctrl+C to stop.\n",
+				cfg.PollingInterval.Duration)
 		}
 
 		// Handle API submission setup
 		var apiKey string
 		if *submit {
 			// Load environment variables from .env file
-			err := loadEnvFile(".env")
+			err := loadEnvFile(cfg.EnvFilePath)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading .env file: %v\n", err)
+				slog.Error("failed to load .env file", "path", cfg.EnvFilePath, "error", err)
 				os.Exit(1)
 			}
 
 			// Get API key from environment
 			apiKey = os.Getenv("RESCUE_TIME_API_KEY")
 			if apiKey == "" {
-				fmt.Fprintf(os.Stderr, "Error: RESCUE_TIME_API_KEY not found in .env file\n")
+				slog.Error("RESCUE_TIME_API_KEY not found in environment")
 				os.Exit(1)
 			}
 
-			// Call with API submission enabled
-			monitorWindowChanges(*interval, true, apiKey, *submissionInterval)
+			monitorWindowChanges(cfg, true, apiKey)
 		} else {
-			// Call without API submission
-			monitorWindowChanges(*interval, false, "", 0)
+			monitorWindowChanges(cfg, false, "")
 		}
 	} else {
 		// Single execution mode
 		currentInfo, err := getCurrentWindowInfo()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting window info: %v\n", err)
+			slog.Error("failed to get window info", "error", err)
 			os.Exit(1)
 		}
 		fmt.Println(currentInfo)
