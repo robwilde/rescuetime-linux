@@ -116,8 +116,23 @@ func getCurrentWindowInfo() (string, error) {
 func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 	var lastAppClass, lastWindowTitle string
 
-	// Create activity tracker with config values
+	// Create activity tracker and title cleaner
 	tracker := NewActivityTracker(cfg.MergeThreshold.Duration, cfg.MinDuration.Duration)
+	cleaner := NewTitleCleaner()
+
+	// Set up persistence
+	store, err := NewPersistenceStore(cfg.PersistencePath)
+	if err != nil {
+		slog.Warn("persistence disabled", "error", err)
+	} else {
+		// Load saved sessions from previous run
+		saved, err := store.LoadSessions()
+		if err != nil {
+			slog.Warn("failed to load saved sessions", "error", err)
+		} else if len(saved) > 0 {
+			tracker.LoadSessions(saved)
+		}
+	}
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -130,8 +145,9 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 		return
 	}
 
-	// Start the initial session
-	tracker.StartSession(window.Class, window.Title)
+	// Start the initial session with cleaned title
+	cleanedTitle := cleaner.Clean(window.Class, window.Title)
+	tracker.StartSession(window.Class, cleanedTitle)
 	lastAppClass = window.Class
 	lastWindowTitle = window.Title
 
@@ -160,10 +176,18 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 			// End the current session
 			tracker.EndCurrentSession()
 
-			// Submit final data if API submission is enabled
 			if submitToAPI {
+				// Submit final data then clear persistence
 				summaries := tracker.GetActivitySummaries()
 				submitActivitiesToRescueTime(apiKey, summaries)
+				if store != nil {
+					store.Clear()
+				}
+			} else if store != nil {
+				// Save sessions for next run
+				if err := store.SaveSessions(tracker.GetSessions()); err != nil {
+					slog.Error("failed to save sessions on shutdown", "error", err)
+				}
 			}
 
 			// Print summary before exit (user-facing)
@@ -175,8 +199,20 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 			summaries := tracker.GetActivitySummaries()
 			submitActivitiesToRescueTime(apiKey, summaries)
 
-			// Clear completed sessions after successful submission
+			// Clear completed sessions after submission
 			tracker.ClearCompletedSessions()
+
+			// Save any remaining sessions to disk
+			if store != nil {
+				remaining := tracker.GetSessions()
+				if len(remaining) > 0 {
+					if err := store.SaveSessions(remaining); err != nil {
+						slog.Warn("failed to save remaining sessions", "error", err)
+					}
+				} else {
+					store.Clear()
+				}
+			}
 
 		case <-pollTicker.C:
 			window, err := getActiveWindow()
@@ -191,8 +227,9 @@ func monitorWindowChanges(cfg Config, submitToAPI bool, apiKey string) {
 					"from_app", lastAppClass, "to_app", window.Class,
 					"title", window.Title)
 
-				// Start a new session for the new window/app
-				tracker.StartSession(window.Class, window.Title)
+				// Start a new session with cleaned title
+				cleanedTitle := cleaner.Clean(window.Class, window.Title)
+				tracker.StartSession(window.Class, cleanedTitle)
 
 				// Print the change (user-facing)
 				currentInfo := formatWindowOutput(window.Title, window.Class)
