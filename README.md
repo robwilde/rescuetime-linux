@@ -1,12 +1,12 @@
 # RescueTime Linux Activity Tracker
 
-A native Linux activity tracker for [RescueTime](https://www.rescuetime.com) that monitors active window usage on Hyprland/Wayland compositors and submits time tracking data via the RescueTime API.
+A native Linux activity tracker for [RescueTime](https://www.rescuetime.com) that monitors active window usage and submits time tracking data via the RescueTime API. Supports Hyprland and GNOME/X11 with auto-detection.
 
 > **Status:** Phases 1-6 complete. Dual-mode API active. Tests and packaging pending (Phases 7-8).
 
 ## Features
 
-- **Hyprland/Wayland Support** — Monitors active window focus changes using `hyprctl`
+- **Multi-Compositor Support** — Hyprland (`hyprctl`) and GNOME/X11 (`xdotool`) with auto-detection
 - **Smart Session Tracking** — Automatically tracks time spent in each application
 - **Intelligent Merging** — Merges brief window switches to the same app (< 30 seconds)
 - **Session Filtering** — Ignores very short sessions (< 10 seconds) to reduce noise
@@ -25,7 +25,7 @@ A native Linux activity tracker for [RescueTime](https://www.rescuetime.com) tha
 ## Requirements
 
 - **OS:** Linux with Wayland or X11
-- **Compositor:** Hyprland (with `hyprctl` command)
+- **Compositor:** Hyprland (`hyprctl`) or X11/XWayland (`xdotool`) — auto-detected
 - **Runtime:** Go 1.22+ (uses `log/slog`, integer range)
 - **RescueTime Account:** Free or paid account with API access
 
@@ -91,7 +91,7 @@ The application loads configuration from a JSON file at `~/.config/rescuetime-li
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `polling_interval` | `200ms` | How often to poll `hyprctl` for window changes |
+| `polling_interval` | `200ms` | How often to poll for window changes |
 | `submission_interval` | `15m` | How often to submit activity data to RescueTime |
 | `merge_threshold` | `30s` | Merge sessions of the same app if gap is within this |
 | `min_duration` | `10s` | Ignore sessions shorter than this |
@@ -168,7 +168,7 @@ The application loads configuration from a JSON file at `~/.config/rescuetime-li
 # ~/.config/systemd/user/rescuetime.service
 [Unit]
 Description=RescueTime Activity Tracker
-After=hyprland-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple
@@ -194,7 +194,8 @@ systemctl --user start rescuetime.service
 
 | File | Purpose |
 |------|---------|
-| `active-window.go` | `HyprlandWindow` struct, window helpers, `monitorWindowChanges`, `main` |
+| `active-window.go` | Window helpers, `monitorWindowChanges`, `main` |
+| `window.go` | `WindowBackend` interface, `ActiveWindow` struct, compositor backends (Hyprland, Xdotool), auto-detection |
 | `tracker.go` | `ActivitySession`, `ActivitySummary`, `ActivityTracker` and all tracking methods |
 | `api.go` | API types, activation, submission (parallel with bounded concurrency) |
 | `config.go` | `Config` struct, `Duration` JSON wrapper, XDG-aware config loading |
@@ -204,9 +205,9 @@ systemctl --user start rescuetime.service
 
 ### Core Components
 
-**1. Window Monitoring** (`active-window.go`)
-- Polls `hyprctl activewindow -j` for active window data
-- Returns structured `HyprlandWindow` information
+**1. Window Monitoring** (`window.go`, `active-window.go`)
+- Auto-detects compositor: Hyprland (`hyprctl`) or X11/XWayland (`xdotool`)
+- Returns structured `ActiveWindow` information (class, title)
 - Configurable polling interval (default: 200ms)
 
 **2. Activity Tracking** (`tracker.go`)
@@ -331,7 +332,7 @@ Documentation: `RescueTime-Complete-Authentication-Reverse-Engineering-Report.md
 ## Development Status
 
 ### Completed (Phases 1-6)
-- ✅ Hyprland/Wayland window detection via `hyprctl`
+- ✅ Multi-compositor window detection (Hyprland via `hyprctl`, X11 via `xdotool`)
 - ✅ Real-time window focus monitoring
 - ✅ Activity session tracking with start/end times
 - ✅ Session merging for brief interruptions
@@ -400,15 +401,14 @@ HTTP requests for testing authentication and endpoints are in `rescuetime-auth.h
 
 ## Platform Notes
 
-- **Hyprland-specific:** Uses `hyprctl activewindow -j` command
-- **Not portable:** Requires modifications for X11, Windows, or macOS
+- **Auto-detection:** Checks for `hyprctl` (Hyprland) first, then `xdotool` (X11/XWayland)
 - **Display required:** Checks for `WAYLAND_DISPLAY` or `DISPLAY` environment variable
+- **Not portable:** Linux-only; macOS and Windows not supported
 
 ## Contributing
 
 Contributions are welcome! Areas of interest:
 - Support for other Wayland compositors (Sway, etc.)
-- X11/Xorg support
 - Unit and integration tests
 - Performance profiling and optimization
 - Distribution packaging (AUR, Flatpak, etc.)
@@ -429,3 +429,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - RescueTime for providing time tracking services
 - Hyprland compositor for clean JSON output via `hyprctl`
+- xdotool for X11 window detection
