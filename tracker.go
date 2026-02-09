@@ -202,3 +202,21 @@ func (at *ActivityTracker) ClearCompletedSessions() {
 	// Clear all stored sessions but keep the current active one
 	at.sessions = make([]ActivitySession, 0)
 }
+
+// GetSessions returns a copy of all completed sessions
+func (at *ActivityTracker) GetSessions() []ActivitySession {
+	at.mu.RLock()
+	defer at.mu.RUnlock()
+
+	result := make([]ActivitySession, len(at.sessions))
+	copy(result, at.sessions)
+	return result
+}
+
+// LoadSessions merges persisted sessions into the tracker
+func (at *ActivityTracker) LoadSessions(sessions []ActivitySession) {
+	at.mu.Lock()
+	defer at.mu.Unlock()
+
+	at.sessions = append(sessions, at.sessions...)
+}
